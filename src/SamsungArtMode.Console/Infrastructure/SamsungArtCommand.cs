@@ -34,6 +34,11 @@ public abstract class SamsungArtCommand<TSettings> : AsyncCommand<TSettings>
             OutputHelper.WriteError($"Connection failed: {ex.Message}");
             return 2;
         }
+        catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+        {
+            OutputHelper.WriteError("Timed out waiting for a response from the TV.");
+            return 2;
+        }
     }
 
     protected abstract Task<object> ExecuteAsync(SamsungTvClient client, TSettings settings, CancellationToken ct);

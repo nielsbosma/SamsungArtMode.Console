@@ -30,7 +30,7 @@ public sealed class SamsungTvClient : IDisposable
         var name = Convert.ToBase64String(Encoding.UTF8.GetBytes("SamsungArtCli"));
         var uri = _token is not null
             ? new Uri($"wss://{_host}:8002/api/v2/channels/{ArtEndpoint}?name={name}&token={_token}")
-            : new Uri($"ws://{_host}:8001/api/v2/channels/{ArtEndpoint}?name={name}");
+            : new Uri($"wss://{_host}:8002/api/v2/channels/{ArtEndpoint}?name={name}");
 
         if (_verbose)
             System.Console.Error.WriteLine($"WS connecting to {uri.Scheme}://{uri.Host}:{uri.Port}...");
@@ -88,10 +88,12 @@ public sealed class SamsungTvClient : IDisposable
 
         var fileBytes = await File.ReadAllBytesAsync(filePath, ct);
         var ext = Path.GetExtension(filePath).TrimStart('.').ToLowerInvariant();
-        if (ext is "jpg") ext = "jpeg";
-        if (ext is not ("png" or "jpeg"))
+        // The TV expects "jpg" (not "jpeg") for JPEG uploads
+        if (ext is "jpeg") ext = "jpg";
+        if (ext is not ("png" or "jpg"))
             throw new SamsungException($"Unsupported image format: {ext}. Use PNG or JPEG.");
 
+        // The TV correlates the upload by a single UUID used for id, request_id and conn_info.id
         var requestId = Guid.NewGuid().ToString();
         var connId = Random.Shared.Next(1, 999999);
 
@@ -100,7 +102,7 @@ public sealed class SamsungTvClient : IDisposable
             ["request"] = "send_image",
             ["file_type"] = ext,
             ["file_size"] = fileBytes.Length,
-            ["id"] = Guid.NewGuid().ToString(),
+            ["id"] = requestId,
             ["request_id"] = requestId,
             ["matte_id"] = matteId ?? "none",
             ["portrait_matte_id"] = "none",
@@ -109,7 +111,7 @@ public sealed class SamsungTvClient : IDisposable
             {
                 ["d2d_mode"] = "socket",
                 ["connection_id"] = connId,
-                ["id"] = Guid.NewGuid().ToString()
+                ["id"] = requestId
             }
         };
 
@@ -132,8 +134,15 @@ public sealed class SamsungTvClient : IDisposable
 
         // Wait for ready_to_use with connection info
         var connInfo = await WaitForUploadReadyAsync(ct);
+        // Some TVs send conn_info as a JSON-encoded string rather than an object
+        if (connInfo.ValueKind == JsonValueKind.String)
+        {
+            using var connDoc = JsonDocument.Parse(connInfo.GetString()!);
+            connInfo = connDoc.RootElement.Clone();
+        }
         var ip = connInfo.GetProperty("ip").GetString()!;
-        var port = connInfo.GetProperty("port").GetInt32();
+        var portEl = connInfo.GetProperty("port");
+        var port = portEl.ValueKind == JsonValueKind.String ? int.Parse(portEl.GetString()!) : portEl.GetInt32();
         var secured = connInfo.TryGetProperty("secured", out var sec) && sec.GetBoolean();
         var secKey = connInfo.TryGetProperty("key", out var key) ? key.GetString() : connInfo.TryGetProperty("secKey", out var sk) ? sk.GetString() : "";
 
@@ -156,7 +165,7 @@ public sealed class SamsungTvClient : IDisposable
         Stream stream = tcp.GetStream();
         if (secured)
         {
-            var ssl = new SslStream(stream, false, (_, _, _, _) => true);
+            var ssl = new SslStream(stream, false);
             await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
                 TargetHost = ip,
